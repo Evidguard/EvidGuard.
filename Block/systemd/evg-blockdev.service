@@ -1,0 +1,17 @@
+[Unit]
+Description=EVG Forensic Write-Blocker - Bloqueo inicial de dispositivos
+DefaultDependencies=no
+After=systemd-udevd.service
+Before=local-fs.target
+Wants=systemd-udevd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/evg-blockall
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=evg-blockdev
+
+[Install]
+WantedBy=sysinit.target

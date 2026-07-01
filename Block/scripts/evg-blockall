@@ -1,0 +1,85 @@
+#!/bin/bash
+# ============================================================
+# evg-blockall - Bloquea todos los dispositivos de bloque
+# presentes en el arranque del sistema.
+# Invocado por el servicio evg-blockdev.service
+# ============================================================
+
+LOG_FILE="/var/log/evg-blockdev.log"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+log() {
+    echo "[$TIMESTAMP] [BOOT] $1" | tee -a "$LOG_FILE"
+    logger -t "evg-blockdev" "[BOOT] $1"
+}
+
+log "========================================="
+log "EVG Write-Blocker - Inicio del sistema"
+log "Kernel: $(uname -r)"
+log "Host: $(hostname)"
+log "========================================="
+
+BLOCKED=0
+SKIPPED=0
+ERRORS=0
+
+block_device() {
+    local DEV="$1"
+    local REASON="$2"
+
+    if [ ! -b "$DEV" ]; then
+        return
+    fi
+
+    # Verificar si ya está en RO
+    CURRENT=$(blockdev --getro "$DEV" 2>/dev/null)
+    if [ "$CURRENT" = "1" ]; then
+        log "YA RO: $DEV ($REASON)"
+        return
+    fi
+
+    if blockdev --setro "$DEV" 2>/dev/null; then
+        SIZE=$(blockdev --getsize64 "$DEV" 2>/dev/null || echo "?")
+        log "BLOQUEADO: $DEV [$REASON] Tamaño=${SIZE}B"
+        BLOCKED=$((BLOCKED + 1))
+    else
+        log "ERROR: No se pudo bloquear $DEV"
+        ERRORS=$((ERRORS + 1))
+    fi
+}
+
+# --- Discos SATA/USB (sd*) ---
+for dev in /dev/sd[a-z]; do
+    [ -b "$dev" ] || continue
+    block_device "$dev" "SATA/USB"
+    # Particiones
+    for part in "${dev}"[0-9]*; do
+        [ -b "$part" ] || continue
+        block_device "$part" "partición de $dev"
+    done
+done
+
+# --- NVMe ---
+for dev in /dev/nvme[0-9]n[0-9]; do
+    [ -b "$dev" ] || continue
+    block_device "$dev" "NVMe"
+    for part in "${dev}"p[0-9]*; do
+        [ -b "$part" ] || continue
+        block_device "$part" "partición NVMe"
+    done
+done
+
+# --- MMC externas (mmcblk1+, NO mmcblk0 que es el sistema en RPi) ---
+for dev in /dev/mmcblk[1-9]; do
+    [ -b "$dev" ] || continue
+    block_device "$dev" "MMC externa"
+    for part in "${dev}"p[0-9]*; do
+        [ -b "$part" ] || continue
+        block_device "$part" "partición MMC"
+    done
+done
+
+log "Resultado: $BLOCKED bloqueado(s), $SKIPPED omitido(s), $ERRORS error(es)"
+log "Sistema forense activo — todos los dispositivos externos en READ-ONLY"
+
+exit 0

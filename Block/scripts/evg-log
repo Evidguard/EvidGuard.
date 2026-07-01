@@ -1,0 +1,9 @@
+#!/bin/bash
+# evg-log - Logger auxiliar para reglas udev de EVG
+# Uso: evg-log "mensaje"
+
+LOG_FILE="/var/log/evg-blockdev.log"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+echo "[$TIMESTAMP] $1" >> "$LOG_FILE"
+logger -t "evg-blockdev" "$1"

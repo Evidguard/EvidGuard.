@@ -1,0 +1,846 @@
+#!/usr/bin/env python3
+# ============================================================
+# EVG UnBlock - Herramienta gráfica de gestión de
+# escritura en dispositivos de bloque (Write-Blocker GUI)
+#
+# Equivalente al "UnBlock" de CAINE Linux, adaptado para EvidGuard.
+# Permite al perito forense cambiar el modo de un dispositivo
+# entre Read-Only (bloqueado) y Read-Write (desbloqueado).
+#
+# Requiere: python3-tk, python3-pil, util-linux (blockdev)
+# Ejecutar con: sudo evg-unblock
+# ============================================================
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import subprocess
+import os
+import sys
+import glob
+import threading
+import json
+from datetime import datetime
+from PIL import Image, ImageTk
+
+LOG_FILE   = "/var/log/evg-blockdev.log"
+STATE_FILE = "/var/lib/evg-unblock/state.json"
+VERSION    = "Early Access"
+
+
+# ── Persistencia de estado ─────────────────────────────────
+
+def _load_saved_state():
+    """Carga el estado persistido (dict: device_key → 'ro'|'rw')."""
+    try:
+        with open(STATE_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_state(state: dict):
+    """Guarda el estado en disco, creando el directorio si hace falta."""
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f, indent=2)
+    except Exception:
+        pass
+
+
+def _device_key(dev_info: dict) -> str:
+    """Clave única para un dispositivo: serial si existe, si no el path."""
+    return dev_info.get('serial') or dev_info.get('path', '')
+
+
+# ── Utilidades de sistema ──────────────────────────────────
+
+def check_root():
+    if os.geteuid() != 0:
+        messagebox.showerror(
+            "Permisos insuficientes",
+            "Esta herramienta requiere privilegios de superusuario.\n\n"
+            "Ejecuta: sudo evg-unblock"
+        )
+        sys.exit(1)
+
+
+def log_action(message):
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    line = f"[{ts}] [GUI] {message}\n"
+    try:
+        with open(LOG_FILE, 'a') as f:
+            f.write(line)
+    except Exception:
+        pass
+    try:
+        subprocess.run(['logger', '-t', 'evg-blockdev', f'[GUI] {message}'],
+                       capture_output=True)
+    except Exception:
+        pass
+
+
+def run_cmd(cmd):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return -1, '', 'Tiempo de espera agotado'
+    except Exception as e:
+        return -1, '', str(e)
+
+
+def get_block_devices():
+    """Devuelve lista de dispositivos de bloque relevantes (sin particiones menores)."""
+    devices = []
+    patterns = ['/dev/sd[a-z]', '/dev/nvme[0-9]n[0-9]', '/dev/mmcblk[1-9]']
+    found = []
+    for pat in patterns:
+        found.extend(glob.glob(pat))
+    found.sort()
+
+    for dev in found:
+        if not os.path.exists(dev):
+            continue
+        info = get_device_info(dev)
+        devices.append(info)
+    return devices
+
+
+def get_device_info(dev):
+    """Recopila información de un dispositivo de bloque."""
+    info = {'path': dev, 'name': os.path.basename(dev)}
+
+    rc, out, _ = run_cmd(['blockdev', '--getro', dev])
+    info['ro'] = (out == '1') if rc == 0 else None
+
+    rc, out, _ = run_cmd(['blockdev', '--getsize64', dev])
+    try:
+        size_bytes = int(out)
+        if size_bytes >= 1_000_000_000_000:
+            info['size'] = f"{size_bytes/1e12:.1f} TB"
+        elif size_bytes >= 1_000_000_000:
+            info['size'] = f"{size_bytes/1e9:.1f} GB"
+        elif size_bytes >= 1_000_000:
+            info['size'] = f"{size_bytes/1e6:.0f} MB"
+        else:
+            info['size'] = f"{size_bytes} B"
+    except Exception:
+        info['size'] = "?"
+
+    rc, out, _ = run_cmd(['blockdev', '--getss', dev])
+    info['ss'] = out if rc == 0 else "?"
+
+    rc, out, _ = run_cmd(['udevadm', 'info', '--query=property', f'--name={dev}'])
+    props = {}
+    for line in out.splitlines():
+        if '=' in line:
+            k, _, v = line.partition('=')
+            props[k] = v
+
+    info['vendor'] = props.get('ID_VENDOR', props.get('ID_USB_VENDOR', ''))
+    info['model']  = props.get('ID_MODEL',  props.get('ID_USB_MODEL', ''))
+    info['serial'] = props.get('ID_SERIAL_SHORT', props.get('ID_SERIAL', ''))
+    info['bus']    = props.get('ID_BUS', props.get('SUBSYSTEMS', ''))
+    info['fs_type']  = props.get('ID_FS_TYPE', '')
+    info['fs_label'] = props.get('ID_FS_LABEL', '')
+
+    # Fallback con lsblk si udev no proporcionó la info
+    if not info['fs_type'] or not info['fs_label']:
+        rc_ls, out_ls, _ = run_cmd(['lsblk', '-n', '-r', '-o', 'FSTYPE,LABEL', dev])
+        if rc_ls == 0 and out_ls.strip():
+            parts_ls = out_ls.strip().split()
+            if len(parts_ls) >= 1 and not info['fs_type']:
+                info['fs_type'] = parts_ls[0]
+            if len(parts_ls) >= 2 and not info['fs_label']:
+                info['fs_label'] = parts_ls[1]
+
+    base = os.path.basename(dev)
+    part_pat = f'/dev/{base}p[0-9]*' if base.startswith('mmcblk') else f'/dev/{base}[0-9]*'
+    part_paths = sorted(glob.glob(part_pat))
+
+    # Estado RO de particiones calculado aquí (hilo de fondo)
+    partition_info = []
+    for p in part_paths:
+        rc2, out2, _ = run_cmd(['blockdev', '--getro', p])
+        p_ro = (out2 == '1') if rc2 == 0 else None
+        partition_info.append({'path': p, 'ro': p_ro})
+
+    info['partitions']     = part_paths
+    info['partition_info'] = partition_info
+    return info
+
+
+def set_device_ro(dev):
+    rc, _, err = run_cmd(['blockdev', '--setro', dev])
+    return rc == 0, err
+
+
+def set_device_rw(dev):
+    rc, _, err = run_cmd(['blockdev', '--setrw', dev])
+    return rc == 0, err
+
+
+def get_mount_points(dev):
+    rc, out, _ = run_cmd(['findmnt', '-n', '-o', 'TARGET', '-S', dev])
+    if rc == 0 and out:
+        return [line.strip() for line in out.splitlines() if line.strip()]
+    return []
+
+
+# ── Interfaz gráfica ───────────────────────────────────────
+
+class EVGUnBlock(tk.Tk):
+
+    COLORS = {
+        'bg':        '#0a0a0a',
+        'panel':     '#141414',
+        'accent':    '#2a2a2a',
+        'ro_bg':     '#0d0d0d',
+        'rw_bg':     '#1a0a0a',
+        'ro_badge':  '#ffffff',
+        'rw_badge':  '#ff3333',
+        'text':      '#e0e0e0',
+        'subtext':   '#888888',
+        'btn_lock':  '#ffffff',
+        'btn_unlock':'#ff3333',
+        'btn_hover_lock':  '#cccccc',
+        'btn_hover_unlock':'#cc0000',
+        'header_bg': '#000000',
+        'border':    '#333333',
+        'log_bg':    '#050505',
+    }
+
+    def __init__(self):
+        super().__init__()
+        self.title(f"UnBlock {VERSION}")
+        self.geometry("820x680")
+        self.resizable(True, True)
+        self.configure(bg=self.COLORS['bg'])
+
+        self._refreshing  = False   # evita refrescos concurrentes
+        self._btn_refresh = None
+        # Cancela el timer del flash de estado si se lanza otro antes
+        self._status_timer = None
+        # Estado persistido entre sesiones
+        self._saved_state = _load_saved_state()
+
+        for _icon_path in ("/usr/share/evg/img/icono.png",
+                           "/usr/share/pixmaps/evg-unblock.png"):
+            if os.path.exists(_icon_path):
+                try:
+                    _ico = Image.open(_icon_path).resize((64, 64), Image.Resampling.LANCZOS)
+                    self._win_icon = ImageTk.PhotoImage(_ico)
+                    self.iconphoto(True, self._win_icon)
+                    break
+                except Exception:
+                    continue
+
+        self.device_frames = []
+        self._build_ui()
+        self.refresh_devices()
+
+    # ── Construcción de la UI ──────────────────────────────
+
+    def _build_ui(self):
+        hdr = tk.Frame(self, bg=self.COLORS['header_bg'], height=72)
+        hdr.pack(fill='x')
+        hdr.pack_propagate(False)
+
+        title_frame = tk.Frame(hdr, bg=self.COLORS['header_bg'])
+        title_frame.pack(side='left', padx=18, pady=10)
+
+        LOGO_PATHS = [
+            "/usr/share/evg/img/logo.png",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "img", "logo.png"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "img", "logo.png"),
+        ]
+        ICON_PATHS = [
+            "/usr/share/evg/img/icono.png",
+            "/usr/share/pixmaps/evg-unblock.png",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "img", "icono.png"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "img", "icono.png"),
+        ]
+
+        for _ipath in ICON_PATHS:
+            if os.path.exists(_ipath):
+                try:
+                    _iimg = Image.open(_ipath).resize((32, 32), Image.Resampling.LANCZOS)
+                    self._win_icon = ImageTk.PhotoImage(_iimg)
+                    self.iconphoto(True, self._win_icon)
+                    break
+                except Exception:
+                    continue
+
+        try:
+            logo_path = next((p for p in LOGO_PATHS if os.path.exists(p)), None)
+            if logo_path:
+                img = Image.open(logo_path).resize((52, 52), Image.Resampling.LANCZOS)
+                self.logo_img = ImageTk.PhotoImage(img)
+                tk.Label(title_frame, image=self.logo_img,
+                         bg=self.COLORS['header_bg']).pack(side='left', padx=(0, 10))
+        except Exception:
+            pass
+
+        tk.Label(title_frame, text="Evidence UnBlock",
+                 bg=self.COLORS['header_bg'],
+                 fg='white', font=('DejaVu Sans', 16, 'bold')
+                 ).pack(side='left')
+
+        tk.Label(hdr,
+                 text="Forensic Write-Blocker — Digital Evidence Protection",
+                 bg=self.COLORS['header_bg'],
+                 fg=self.COLORS['subtext'],
+                 font=('DejaVu Sans', 9)
+                 ).pack(side='left', padx=(12, 0), pady=10)
+
+        btn_frame = tk.Frame(hdr, bg=self.COLORS['header_bg'])
+        btn_frame.pack(side='right', padx=12)
+
+        self._btn_refresh = self._hdr_btn(
+            btn_frame, "⟳  Actualizar", self.refresh_devices, self.COLORS['accent'])
+        self._btn_refresh.pack(side='left', padx=4)
+
+        info_bar = tk.Frame(self, bg=self.COLORS['panel'], pady=6)
+        info_bar.pack(fill='x')
+        self.info_label = tk.Label(
+            info_bar,
+            text="Analizando dispositivos...",
+            bg=self.COLORS['panel'],
+            fg=self.COLORS['subtext'],
+            font=('DejaVu Sans', 8)
+        )
+        self.info_label.pack(side='left', padx=16)
+
+        outer = tk.Frame(self, bg=self.COLORS['bg'])
+        outer.pack(fill='both', expand=True, padx=12, pady=6)
+
+        self.canvas = tk.Canvas(outer, bg=self.COLORS['bg'],
+                                highlightthickness=0, bd=0)
+        self.vsb = ttk.Scrollbar(outer, orient='vertical',
+                                 command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vsb.set)
+
+        self.canvas.grid(row=0, column=0, sticky='nsew')
+        self.vsb.grid(row=0, column=1, sticky='ns')
+        outer.grid_rowconfigure(0, weight=1)
+        outer.grid_columnconfigure(0, weight=1)
+        self.vsb.grid_remove()
+
+        self.devices_frame = tk.Frame(self.canvas, bg=self.COLORS['bg'])
+        self.canvas_window = self.canvas.create_window(
+            (0, 0), window=self.devices_frame, anchor='nw')
+        self.devices_frame.bind('<Configure>', self._on_frame_configure)
+        self.canvas.bind('<Configure>', self._on_canvas_configure)
+
+        self.canvas.bind_all('<MouseWheel>', self._on_mousewheel_win)
+        self.canvas.bind_all('<Button-4>',   self._on_mousewheel_linux_up)
+        self.canvas.bind_all('<Button-5>',   self._on_mousewheel_linux_down)
+
+        log_frame = tk.LabelFrame(
+            self, text=" Registro de actividad ",
+            bg=self.COLORS['bg'], fg=self.COLORS['subtext'],
+            font=('DejaVu Sans', 8), bd=1,
+            relief='flat', labelanchor='nw'
+        )
+        log_frame.pack(fill='x', padx=12, pady=(0, 8))
+
+        self.log_text = tk.Text(
+            log_frame, height=5, bg=self.COLORS['log_bg'],
+            fg='#cccccc', font=('Monospace', 8),
+            state='disabled', bd=0, insertbackground='white'
+        )
+        self.log_text.pack(fill='x', padx=4, pady=4)
+        self._load_log_tail()
+
+        status_bar = tk.Frame(self, bg=self.COLORS['panel'], height=22)
+        status_bar.pack(fill='x', side='bottom')
+        status_bar.pack_propagate(False)
+        self.status_label = tk.Label(
+            status_bar, text="Listo",
+            bg=self.COLORS['panel'], fg=self.COLORS['subtext'],
+            font=('DejaVu Sans', 8), anchor='w'
+        )
+        self.status_label.pack(side='left', padx=10)
+
+    def _hdr_btn(self, parent, text, cmd, color):
+        return tk.Button(
+            parent, text=text, command=cmd,
+            bg=color, fg='white',
+            font=('DejaVu Sans', 8, 'bold'),
+            relief='flat', cursor='hand2',
+            padx=10, pady=4, bd=0,
+            activebackground='#3a3a3a',
+            activeforeground='white'
+        )
+
+    # ── Estado / notificaciones ────────────────────────────
+
+    def _flash_status(self, text, color='#00cc66', duration_ms=4000):
+        """Muestra un mensaje temporal en la barra de estado con color.
+        No usa messagebox → sin bucle de eventos anidado → sin freeze."""
+        if self._status_timer is not None:
+            self.after_cancel(self._status_timer)
+            self._status_timer = None
+        self.status_label.config(text=text, fg=color)
+        self._status_timer = self.after(
+            duration_ms,
+            lambda: self.status_label.config(text="Listo", fg=self.COLORS['subtext'])
+        )
+
+    # ── Scroll ─────────────────────────────────────────────
+
+    def _on_frame_configure(self, _):
+        self.canvas.configure(scrollregion=self.canvas.bbox('all'))
+        bbox = self.canvas.bbox('all')
+        if bbox:
+            if (bbox[3] - bbox[1]) > self.canvas.winfo_height():
+                self.vsb.grid()
+            else:
+                self.vsb.grid_remove()
+
+    def _on_canvas_configure(self, event):
+        self.canvas.itemconfig(self.canvas_window, width=event.width)
+
+    def _on_mousewheel_win(self, event):
+        if event.delta:
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+
+    def _on_mousewheel_linux_up(self, event):
+        self.canvas.yview_scroll(-1, 'units')
+
+    def _on_mousewheel_linux_down(self, event):
+        self.canvas.yview_scroll(1, 'units')
+
+    # ── Dispositivos ───────────────────────────────────────
+
+    def refresh_devices(self):
+        if self._refreshing:
+            return
+        self._refreshing = True
+
+        if self._btn_refresh:
+            self._btn_refresh.config(state='disabled', text="⟳  Actualizando...")
+
+        self.info_label.config(text="Analizando dispositivos...")
+        self.update_idletasks()
+
+        for w in self.devices_frame.winfo_children():
+            w.destroy()
+        tk.Label(
+            self.devices_frame,
+            text="🔄  Detectando dispositivos...",
+            bg=self.COLORS['bg'], fg=self.COLORS['subtext'],
+            font=('DejaVu Sans', 10)
+        ).pack(pady=60)
+
+        def _fetch():
+            devices = get_block_devices()
+            self.after(0, self._on_devices_loaded, devices)
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _on_devices_loaded(self, devices):
+        for w in self.devices_frame.winfo_children():
+            w.destroy()
+
+        if not devices:
+            tk.Label(
+                self.devices_frame,
+                text="⚠  No se detectaron dispositivos de bloque externos.\n\n"
+                     "Conecta un disco USB, SSD o tarjeta SD para comenzar.",
+                bg=self.COLORS['bg'], fg=self.COLORS['subtext'],
+                font=('DejaVu Sans', 10), justify='center'
+            ).pack(pady=60)
+            self.info_label.config(text="Sin dispositivos externos detectados.")
+        else:
+            ro_count = sum(1 for d in devices if d['ro'] is True)
+            rw_count = sum(1 for d in devices if d['ro'] is False)
+            for dev in devices:
+                self._build_device_card(dev)
+            self.info_label.config(
+                text=f"{len(devices)} dispositivo(s) detectado(s)  •  "
+                     f"🔒 {ro_count} bloqueado(s)  •  "
+                     f"🔓 {rw_count} desbloqueado(s)"
+            )
+
+        self._load_log_tail()
+
+        if self._btn_refresh:
+            self._btn_refresh.config(state='normal', text="⟳  Actualizar")
+        self._refreshing = False
+
+        # ── Restaurar estado persistido ────────────────────
+        if devices and self._saved_state:
+            self._restore_saved_states(devices)
+
+    def _restore_saved_states(self, devices):
+        """Al arrancar, aplica el último estado guardado a cada dispositivo."""
+        for dev in devices:
+            key = _device_key(dev)
+            saved = self._saved_state.get(key) or self._saved_state.get(dev['path'])
+            if saved is None:
+                continue
+
+            current_is_ro = dev['ro'] is True
+            if saved == 'ro' and not current_is_ro:
+                log_action(f"Restaurando READ-ONLY en {dev['path']} (estado guardado)")
+                self._flash_status(
+                    f"⏳  Restaurando READ-ONLY en {dev['path']}...",
+                    color='#aaaaaa', duration_ms=30000
+                )
+                def _do_restore_ro(dev_path=dev['path']):
+                    base     = os.path.basename(dev_path)
+                    part_pat = f'/dev/{base}p[0-9]*' if 'mmcblk' in base else f'/dev/{base}[0-9]*'
+                    parts    = glob.glob(part_pat)
+                    for p in parts:
+                        for mp in get_mount_points(p):
+                            run_cmd(['mount', '-o', 'remount,ro', mp])
+                    for mp in get_mount_points(dev_path):
+                        run_cmd(['mount', '-o', 'remount,ro', mp])
+                    ok, err = set_device_ro(dev_path)
+                    for p in parts:
+                        set_device_ro(p)
+                    self.after(0, self._on_lock_done, dev_path, ok, err)
+                threading.Thread(target=_do_restore_ro, daemon=True).start()
+
+            elif saved == 'rw' and current_is_ro:
+                log_action(f"Restaurando READ-WRITE en {dev['path']} (estado guardado)")
+                self._flash_status(
+                    f"⏳  Restaurando READ-WRITE en {dev['path']}...",
+                    color='#aaaaaa', duration_ms=30000
+                )
+                def _do_restore_rw(dev_path=dev['path']):
+                    base     = os.path.basename(dev_path)
+                    part_pat = f'/dev/{base}p[0-9]*' if 'mmcblk' in base else f'/dev/{base}[0-9]*'
+                    parts    = glob.glob(part_pat)
+                    ok, err  = set_device_rw(dev_path)
+                    for p in parts:
+                        set_device_rw(p)
+                    remount_ok = True
+                    if ok:
+                        for p in parts:
+                            for mp in get_mount_points(p):
+                                rc, _, rerr = run_cmd(['mount', '-o', 'remount,rw', mp])
+                                if rc != 0:
+                                    remount_ok = False
+                        for mp in get_mount_points(dev_path):
+                            rc, _, _ = run_cmd(['mount', '-o', 'remount,rw', mp])
+                            if rc != 0:
+                                remount_ok = False
+                    self.after(0, self._on_unlock_done, dev_path, ok, err, remount_ok)
+                threading.Thread(target=_do_restore_rw, daemon=True).start()
+
+    def _build_device_card(self, dev):
+        is_ro    = dev['ro'] is True
+        card_bg  = self.COLORS['ro_bg']   if is_ro else self.COLORS['rw_bg']
+        badge_col = self.COLORS['ro_badge'] if is_ro else self.COLORS['rw_badge']
+        badge_text = "🔒  READ-ONLY" if is_ro else "🔓  READ-WRITE"
+        badge_fg   = '#000000'        if is_ro else '#ffffff'
+
+        card = tk.Frame(self.devices_frame, bg=card_bg,
+                        relief='flat', bd=0,
+                        highlightbackground=self.COLORS['border'],
+                        highlightthickness=1)
+        card.pack(fill='x', padx=4, pady=5)
+
+        top = tk.Frame(card, bg=card_bg)
+        top.pack(fill='x', padx=14, pady=(10, 4))
+
+        tk.Label(top, text=f"  {dev['path']}",
+                 bg=card_bg, fg='white',
+                 font=('DejaVu Sans', 13, 'bold')
+                 ).pack(side='left')
+
+        tk.Label(top, text=badge_text,
+                 bg=badge_col, fg=badge_fg,
+                 font=('DejaVu Sans', 8, 'bold'),
+                 padx=10, pady=3, relief='solid', bd=1
+                 ).pack(side='left', padx=10)
+
+        det = tk.Frame(card, bg=card_bg)
+        det.pack(fill='x', padx=14, pady=2)
+
+        details = []
+        if dev['vendor'] or dev['model']:
+            details.append(f"{dev['vendor']} {dev['model']}".strip())
+        if dev['serial']:
+            details.append(f"S/N: {dev['serial']}")
+        details.append(f"Tamaño: {dev['size']}")
+        details.append(f"Sector: {dev['ss']} B")
+        if dev['bus']:
+            details.append(f"Bus: {dev['bus'].upper()}")
+        if dev['fs_label']:
+            details.append(f"Etiqueta: {dev['fs_label']}")
+        if dev['fs_type']:
+            details.append(f"FS: {dev['fs_type']}")
+
+        tk.Label(det, text="   •   ".join(details),
+                 bg=card_bg, fg=self.COLORS['subtext'],
+                 font=('DejaVu Sans', 8)
+                 ).pack(side='left')
+
+        if dev.get('partition_info'):
+            pf = tk.Frame(card, bg=card_bg)
+            pf.pack(fill='x', padx=14, pady=(0, 4))
+            part_labels = [
+                f"{'🔒' if p['ro'] is True else '🔓'} {os.path.basename(p['path'])}"
+                for p in dev['partition_info']
+            ]
+            tk.Label(pf,
+                     text="Particiones: " + "  ".join(part_labels),
+                     bg=card_bg, fg=self.COLORS['subtext'],
+                     font=('Monospace', 8)
+                     ).pack(side='left')
+
+        tk.Frame(card, bg=self.COLORS['border'], height=1
+                 ).pack(fill='x', padx=14, pady=4)
+
+        btn_row = tk.Frame(card, bg=card_bg)
+        btn_row.pack(fill='x', padx=14, pady=(0, 10))
+
+        if is_ro:
+            lock_bg, lock_fg     = '#333333', '#666666'
+            unlock_bg, unlock_fg = self.COLORS['btn_unlock'], '#ffffff'
+        else:
+            lock_bg, lock_fg     = self.COLORS['btn_lock'], '#000000'
+            unlock_bg, unlock_fg = '#4a1a1a', '#666666'
+
+        tk.Button(
+            btn_row,
+            text="🔒  Bloquear (Read-Only)",
+            command=lambda d=dev['path']: self._action_lock(d),
+            bg=lock_bg, fg=lock_fg,
+            font=('DejaVu Sans', 9, 'bold'),
+            relief='flat', cursor='hand2',
+            padx=14, pady=6, bd=0,
+            state='disabled' if is_ro else 'normal',
+            activebackground=self.COLORS['btn_hover_lock'],
+            activeforeground='#000000',
+            disabledforeground=lock_fg
+        ).pack(side='left', padx=(0, 8))
+
+        tk.Button(
+            btn_row,
+            text="🔓  Desbloquear (Read-Write)",
+            command=lambda d=dev['path']: self._action_unlock(d),
+            bg=unlock_bg, fg=unlock_fg,
+            font=('DejaVu Sans', 9, 'bold'),
+            relief='flat', cursor='hand2',
+            padx=14, pady=6, bd=0,
+            state='disabled' if not is_ro else 'normal',
+            activebackground=self.COLORS['btn_hover_unlock'],
+            activeforeground='white',
+            disabledforeground=unlock_fg
+        ).pack(side='left')
+
+        tk.Button(
+            btn_row,
+            text="ℹ  Informe",
+            command=lambda d=dev: self._show_report(d),
+            bg=self.COLORS['accent'], fg='white',
+            font=('DejaVu Sans', 9),
+            relief='flat', cursor='hand2',
+            padx=10, pady=6, bd=0,
+            activebackground='#3a3a3a',
+            activeforeground='white'
+        ).pack(side='right')
+
+    # ── Acciones ───────────────────────────────────────────
+
+    def _action_lock(self, dev_path):
+        # Diálogo de confirmación ANTES de lanzar el hilo (sin conflicto)
+        confirm = messagebox.askyesno(
+            "Confirmar bloqueo",
+            f"¿Establecer {dev_path} en modo READ-ONLY?\n\n"
+            "El dispositivo quedará protegido contra escritura.\n"
+            "Los sistemas de ficheros montados pueden verse afectados.",
+            icon='warning'
+        )
+        if not confirm:
+            return
+
+        self._flash_status(f"⏳  Bloqueando {dev_path}...", color='#aaaaaa', duration_ms=30000)
+        self.update_idletasks()
+
+        def _do_lock():
+            base     = os.path.basename(dev_path)
+            part_pat = f'/dev/{base}p[0-9]*' if 'mmcblk' in base else f'/dev/{base}[0-9]*'
+            parts    = glob.glob(part_pat)
+
+            for p in parts:
+                for mp in get_mount_points(p):
+                    run_cmd(['mount', '-o', 'remount,ro', mp])
+            for mp in get_mount_points(dev_path):
+                run_cmd(['mount', '-o', 'remount,ro', mp])
+
+            ok, err = set_device_ro(dev_path)
+            for p in parts:
+                set_device_ro(p)
+
+            self.after(0, self._on_lock_done, dev_path, ok, err)
+
+        threading.Thread(target=_do_lock, daemon=True).start()
+
+    def _on_lock_done(self, dev_path, ok, err):
+        # FIX PRINCIPAL: sin messagebox aquí → sin bucle de eventos anidado → sin freeze
+        if ok:
+            log_action(f"BLOQUEADO en READ-ONLY: {dev_path}")
+            self._flash_status(f"✓  {dev_path}  →  READ-ONLY", color='#00cc66')
+            # Persistir estado
+            self._saved_state[dev_path] = 'ro'
+            _save_state(self._saved_state)
+        else:
+            log_action(f"ERROR al bloquear {dev_path}: {err}")
+            self._flash_status(f"✗  Error al bloquear {dev_path}: {err[:60]}", color='#ff4444')
+        self.refresh_devices()
+
+    def _action_unlock(self, dev_path):
+        # Diálogo de confirmación ANTES de lanzar el hilo (sin conflicto)
+        confirm = messagebox.askyesno(
+            "⚠ Confirmar desbloqueo",
+            f"¿Establecer {dev_path} en modo READ-WRITE?\n\n"
+            "ADVERTENCIA FORENSE: El dispositivo podrá ser modificado.\n"
+            "Solo continúa si es necesario para el proceso pericial.\n\n"
+            "¿Deseas continuar?",
+            icon='warning'
+        )
+        if not confirm:
+            return
+
+        self._flash_status(f"⏳  Desbloqueando {dev_path}...", color='#aaaaaa', duration_ms=30000)
+        self.update_idletasks()
+
+        def _do_unlock():
+            base     = os.path.basename(dev_path)
+            part_pat = f'/dev/{base}p[0-9]*' if 'mmcblk' in base else f'/dev/{base}[0-9]*'
+            parts    = glob.glob(part_pat)
+
+            ok, err = set_device_rw(dev_path)
+            for p in parts:
+                set_device_rw(p)
+
+            remount_ok = True
+            if ok:                        # FIX: remount solo si desbloqueo fue exitoso
+                for p in parts:
+                    for mp in get_mount_points(p):
+                        rc, _, rerr = run_cmd(['mount', '-o', 'remount,rw', mp])
+                        if rc != 0:
+                            remount_ok = False
+                            log_action(f"AVISO: No se pudo remontar RW {mp}: {rerr}")
+                for mp in get_mount_points(dev_path):
+                    rc, _, rerr = run_cmd(['mount', '-o', 'remount,rw', mp])
+                    if rc != 0:
+                        remount_ok = False
+
+            self.after(0, self._on_unlock_done, dev_path, ok, err, remount_ok)
+
+        threading.Thread(target=_do_unlock, daemon=True).start()
+
+    def _on_unlock_done(self, dev_path, ok, err, remount_ok):
+        # FIX PRINCIPAL: sin messagebox aquí → sin bucle de eventos anidado → sin freeze
+        if ok:
+            log_action(f"DESBLOQUEADO en READ-WRITE: {dev_path}")
+            # Persistir estado
+            self._saved_state[dev_path] = 'rw'
+            _save_state(self._saved_state)
+            if not remount_ok:
+                self._flash_status(
+                    f"⚠  {dev_path}  →  READ-WRITE  (algunos montajes pendientes)",
+                    color='#ff9900'
+                )
+            else:
+                self._flash_status(
+                    f"⚠  {dev_path}  →  READ-WRITE  — recuerda volver a bloquear",
+                    color='#ff9900'
+                )
+        else:
+            log_action(f"ERROR al desbloquear {dev_path}: {err}")
+            self._flash_status(f"✗  Error al desbloquear {dev_path}: {err[:60]}", color='#ff4444')
+        self.refresh_devices()
+
+    # ── Informe ────────────────────────────────────────────
+
+    def _show_report(self, dev):
+        win = tk.Toplevel(self)
+        win.title(f"Informe — {dev['path']}")
+        win.geometry("560x420")
+        win.configure(bg=self.COLORS['bg'])
+        win.transient(self)
+
+        tk.Label(win, text=f"Informe forense: {dev['path']}",
+                 bg=self.COLORS['header_bg'], fg='white',
+                 font=('DejaVu Sans', 11, 'bold')
+                 ).pack(fill='x', pady=0)
+
+        txt = tk.Text(win, bg=self.COLORS['log_bg'], fg=self.COLORS['text'],
+                      font=('Monospace', 9), bd=0, padx=12, pady=8)
+        txt.pack(fill='both', expand=True, padx=8, pady=8)
+
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        lines = [
+            f"Fecha/Hora   : {ts}",
+            f"Dispositivo  : {dev['path']}",
+            f"Estado       : {'READ-ONLY (protegido)' if dev['ro'] else 'READ-WRITE (NO protegido)'}",
+            f"Tamaño       : {dev['size']}",
+            f"Sector lógico: {dev['ss']} bytes",
+            f"Fabricante   : {dev['vendor'] or 'desconocido'}",
+            f"Modelo       : {dev['model'] or 'desconocido'}",
+            f"Número serie : {dev['serial'] or 'desconocido'}",
+            f"Bus          : {dev['bus'] or 'desconocido'}",
+            f"FS tipo      : {dev['fs_type'] or 'desconocido'}",
+            f"FS etiqueta  : {dev['fs_label'] or 'ninguna'}",
+            "", "Particiones:",
+        ]
+        for p_info in dev.get('partition_info', []):
+            estado = "READ-ONLY" if p_info['ro'] is True else "READ-WRITE"
+            rc2, sz, _ = run_cmd(['blockdev', '--getsize64', p_info['path']])
+            try:
+                sb = int(sz)
+                sz_str = f"{sb/1e9:.1f} GB" if sb >= 1e9 else f"{sb/1e6:.0f} MB"
+            except Exception:
+                sz_str = "?"
+            lines.append(f"  {p_info['path']}  [{estado}]  {sz_str}")
+
+        lines += ["", "Hash identificativo (primeros 512 bytes):"]
+        rc, out, _ = run_cmd(['bash', '-c',
+            f'dd if={dev["path"]} bs=512 count=1 2>/dev/null | md5sum'])
+        lines.append(f"  MD5: {out.split()[0] if out else 'no disponible'}")
+
+        txt.insert('1.0', '\n'.join(lines))
+        txt.config(state='disabled')
+
+        def copy_report():
+            self.clipboard_clear()
+            self.clipboard_append(txt.get('1.0', 'end-1c'))
+            self._flash_status("Informe copiado al portapapeles", color='#00cc66')
+
+        tk.Button(win, text="📋 Copiar informe", command=copy_report,
+                  bg=self.COLORS['accent'], fg='white',
+                  font=('DejaVu Sans', 9), relief='flat',
+                  padx=12, pady=6, bd=0
+                  ).pack(pady=(0, 10))
+
+    # ── Log viewer ─────────────────────────────────────────
+
+    def _load_log_tail(self):
+        self.log_text.config(state='normal')
+        self.log_text.delete('1.0', 'end')
+        try:
+            rc, out, _ = run_cmd(['tail', '-20', LOG_FILE])
+            if out:
+                self.log_text.insert('end', out)
+                self.log_text.see('end')
+            else:
+                self.log_text.insert('end', '(sin entradas de registro aún)')
+        except Exception:
+            self.log_text.insert('end', '(log no disponible)')
+        self.log_text.config(state='disabled')
+
+
+# ── Entry point ────────────────────────────────────────────
+
+if __name__ == '__main__':
+    check_root()
+    app = EVGUnBlock()
+    app.mainloop()

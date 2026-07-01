@@ -1,0 +1,46 @@
+# ============================================================
+# EVG Forensic Write-Blocker - udev rules
+# Archivo: /etc/udev/rules.d/80-evg-blockdev.rules
+#
+# Bloquea todos los dispositivos de bloque en modo Read-Only
+# al ser detectados, siguiendo el modelo de EVG Linux.
+#
+# Excluye: SD card del sistema (mmcblk0), loop devices,
+#           ram disks y el propio sistema de ficheros raíz.
+# ============================================================
+
+# --- Dispositivos USB de almacenamiento (pendrives, HDD externos) ---
+SUBSYSTEM=="block", KERNEL=="sd[a-z]", \
+    ACTION=="add", \
+    RUN+="/usr/local/sbin/evg-setro %k"
+
+SUBSYSTEM=="block", KERNEL=="sd[a-z][0-9]*", \
+    ACTION=="add", \
+    RUN+="/usr/local/sbin/evg-setro %k"
+
+# --- NVMe (por si se conecta adaptador USB-NVMe) ---
+SUBSYSTEM=="block", KERNEL=="nvme[0-9]n[0-9]", \
+    ACTION=="add", \
+    RUN+="/usr/local/sbin/evg-setro %k"
+
+SUBSYSTEM=="block", KERNEL=="nvme[0-9]n[0-9]p[0-9]*", \
+    ACTION=="add", \
+    RUN+="/usr/local/sbin/evg-setro %k"
+
+# --- MMC/SD externas (no mmcblk0 que es la SD del sistema) ---
+SUBSYSTEM=="block", KERNEL=="mmcblk[1-9]", \
+    ACTION=="add", \
+    RUN+="/usr/local/sbin/evg-setro %k"
+
+SUBSYSTEM=="block", KERNEL=="mmcblk[1-9]p[0-9]*", \
+    ACTION=="add", \
+    RUN+="/usr/local/sbin/evg-setro %k"
+
+# --- Registrar eventos de conexión ---
+SUBSYSTEM=="block", KERNEL=="sd[a-z]", \
+    ACTION=="add", \
+    RUN+="/usr/local/sbin/evg-log 'Dispositivo conectado: /dev/%k - establecido READ-ONLY'"
+
+SUBSYSTEM=="block", KERNEL=="mmcblk[1-9]", \
+    ACTION=="add", \
+    RUN+="/usr/local/sbin/evg-log 'Dispositivo MMC conectado: /dev/%k - establecido READ-ONLY'"

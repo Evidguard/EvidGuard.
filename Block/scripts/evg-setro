@@ -1,0 +1,61 @@
+#!/bin/bash
+# ============================================================
+# evg-setro - EVG Forensic Write-Blocker
+# Establece un dispositivo de bloque en modo Read-Only
+# Invocado por udev al detectar un nuevo dispositivo.
+#
+# Uso: evg-setro <kernel_name>   (ej: sda, sdb1, mmcblk1)
+# ============================================================
+
+DEVICE="/dev/$1"
+LOG_FILE="/var/log/evg-blockdev.log"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+# Función de log con timestamp
+log() {
+    echo "[$TIMESTAMP] $1" >> "$LOG_FILE"
+    logger -t "evg-blockdev" "$1"
+}
+
+# Verificar que el dispositivo existe
+if [ ! -b "$DEVICE" ]; then
+    log "AVISO: $DEVICE no es un dispositivo de bloque válido, ignorando."
+    exit 0
+fi
+
+# Excluir explícitamente la SD del sistema (mmcblk0 y sus particiones)
+case "$1" in
+    mmcblk0|mmcblk0p*)
+        log "INFO: $DEVICE es el dispositivo del sistema, omitiendo protección."
+        exit 0
+        ;;
+    loop*|ram*|zram*)
+        exit 0
+        ;;
+esac
+
+# Comprobar si ya está en read-only
+CURRENT_RO=$(blockdev --getro "$DEVICE" 2>/dev/null)
+if [ "$CURRENT_RO" = "1" ]; then
+    log "INFO: $DEVICE ya está en modo READ-ONLY."
+    exit 0
+fi
+
+# Aplicar read-only
+if blockdev --setro "$DEVICE" 2>/dev/null; then
+    # Recoger información del dispositivo para el log forense
+    SIZE=$(blockdev --getsize64 "$DEVICE" 2>/dev/null || echo "desconocido")
+    SS=$(blockdev --getss "$DEVICE" 2>/dev/null || echo "desconocido")
+    
+    # Obtener información adicional via udevadm
+    VENDOR=$(udevadm info --query=property --name="$DEVICE" 2>/dev/null | grep "^ID_VENDOR=" | cut -d= -f2)
+    MODEL=$(udevadm info --query=property --name="$DEVICE" 2>/dev/null | grep "^ID_MODEL=" | cut -d= -f2)
+    SERIAL=$(udevadm info --query=property --name="$DEVICE" 2>/dev/null | grep "^ID_SERIAL=" | cut -d= -f2)
+    
+    log "OK: $DEVICE bloqueado en READ-ONLY | Tamaño: ${SIZE}B | Sector: ${SS}B | Fabricante: ${VENDOR:-desconocido} | Modelo: ${MODEL:-desconocido} | Serie: ${SERIAL:-desconocido}"
+else
+    log "ERROR: No se pudo establecer READ-ONLY en $DEVICE"
+    exit 1
+fi
+
+exit 0
