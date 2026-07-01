@@ -61,7 +61,7 @@ EVG Write-Blocker protege los dispositivos fuente mientras Rclone Manager realiz
 
 ### 1. EVG Write-Blocker (Block)
 
-**Carpeta:** `Block-fixed-v4/`
+**Carpeta:** `Block/`
 
 Write-blocker software al estilo forense, equivalente funcional al "UnBlock" de CAINE Linux, adaptado para Raspberry Pi. Garantiza que cualquier dispositivo de almacenamiento conectado quede en modo **solo lectura** de forma automática e inmediata, protegiendo la integridad de las evidencias.
 
@@ -152,7 +152,7 @@ El panel se lanza con privilegios de administrador mediante `pkexec` (con diálo
 #### Instalación
 
 ```bash
-cd spyguard-cp-v2_2_1/
+cd spyguard-control-panel/
 sudo ./install.sh
 ```
 
