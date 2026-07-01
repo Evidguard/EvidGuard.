@@ -49,7 +49,7 @@ Todas las herramientas detectan e instalan sus dependencias durante el proceso d
 
 Las tres herramientas están diseñadas para usarse **en conjunto con Rclone Manager**, que debe instalarse por separado. Rclone Manager es la interfaz gráfica oficial de rclone y es el componente responsable de gestionar y ejecutar las transferencias de datos entre la Raspberry Pi y el almacenamiento en la nube o remoto.
 
-> 🔗 **Descarga e instrucciones de instalación:** [https://github.com/Zarestia-Dev/rclone-manager](rclonemanager)
+> 🔗 **Descarga e instrucciones de instalación:** https://github.com/Zarestia-Dev/rclone-manager
 
 EVG Write-Blocker protege los dispositivos fuente mientras Rclone Manager realiza la copia, y EvidGuard LogWatch vigila el log generado por Rclone Manager para notificar sobre el estado de cada transferencia.
 
