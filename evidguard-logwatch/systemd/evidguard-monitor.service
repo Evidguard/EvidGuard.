@@ -1,0 +1,15 @@
+[Unit]
+Description=EvidGuard — Envía correo cuando cambia el log de rclone
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/evidguard-logwatch/bin/evidguard-report.sh --auto
+StandardOutput=journal
+StandardError=journal
+# v5: WAIT_MAX=300 por defecto → 300s + margen de seguridad
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

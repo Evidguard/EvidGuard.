@@ -1,0 +1,8 @@
+[Unit]
+Description=EvidGuard — Vigila el log de rclone manager
+
+[Path]
+PathModified=RCLONE_GUI_LOG_PLACEHOLDER
+
+[Install]
+WantedBy=multi-user.target
