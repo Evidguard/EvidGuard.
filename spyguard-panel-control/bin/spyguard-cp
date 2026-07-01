@@ -1,0 +1,81 @@
+#!/bin/bash
+# SpyGuard Control Panel - Wrapper ejecutable v2.2.1
+# Instalado en /opt/spyguard-cp/bin/spyguard-cp
+
+INSTALL_DIR="/opt/spyguard-cp"
+PYTHON="/usr/bin/python3"
+SCRIPT="$INSTALL_DIR/lib/spyguard_control_panel.py"
+LOG="/tmp/spyguard-wrapper.log"
+
+log() {
+    echo "[$(date '+%H:%M:%S')] $1" >> "$LOG"
+}
+
+# Verificar que el script existe
+if [ ! -f "$SCRIPT" ]; then
+    MSG="Error: No se encuentra $SCRIPT\nEjecuta primero: sudo ./install.sh"
+    log "$MSG"
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --error --text="$MSG" 2>/dev/null
+    elif command -v xmessage >/dev/null 2>&1; then
+        xmessage -center "$MSG" 2>/dev/null
+    else
+        echo -e "$MSG"
+    fi
+    exit 1
+fi
+
+# Verificar python3
+if ! command -v "$PYTHON" >/dev/null 2>&1; then
+    MSG="Error: python3 no encontrado. Instálalo con:\nsudo apt install python3 python3-tk"
+    log "$MSG"
+    if command -v zenity >/dev/null 2>&1; then zenity --error --text="$MSG"; else echo -e "$MSG"; fi
+    exit 1
+fi
+
+# --- Capturar variables de entorno gráfico ANTES de elevar privilegios ---
+# En Debian 13 (polkit 0.120+) pkexec/sudo NO heredan estas variables.
+# Hay que pasarlas explícitamente vía "env VAR=val".
+ENV_PAIRS=()
+for VAR in DISPLAY XAUTHORITY WAYLAND_DISPLAY XDG_RUNTIME_DIR \
+           DBUS_SESSION_BUS_ADDRESS XDG_SESSION_TYPE XDG_SESSION_DESKTOP \
+           GDK_BACKEND; do
+    VAL="${!VAR}"
+    if [ -n "$VAL" ]; then
+        ENV_PAIRS+=("$VAR=$VAL")
+    fi
+done
+
+# Fallback: si no se detectó DISPLAY ni WAYLAND, asumir :0
+if [ -z "$DISPLAY" ] && [ -z "$WAYLAND_DISPLAY" ]; then
+    ENV_PAIRS+=("DISPLAY=:0")
+    log "ADVERTENCIA: DISPLAY no detectado, usando :0 como fallback"
+fi
+
+log "Variables de entorno gráfico capturadas: ${ENV_PAIRS[*]}"
+
+# Lanzar con pkexec (preferido, GUI de autenticación) o sudo como fallback
+launch() {
+    if command -v pkexec >/dev/null 2>&1; then
+        log "Lanzando $SCRIPT con pkexec env ..."
+        pkexec env "${ENV_PAIRS[@]}" "$PYTHON" "$SCRIPT" "$@" 2>>"$LOG"
+        RC=$?
+        if [ $RC -ne 0 ]; then
+            log "pkexec falló (código $RC), intentando sudo..."
+            sudo env "${ENV_PAIRS[@]}" "$PYTHON" "$SCRIPT" "$@" 2>>"$LOG"
+            RC=$?
+        fi
+        return $RC
+    else
+        log "pkexec no disponible, usando sudo..."
+        sudo env "${ENV_PAIRS[@]}" "$PYTHON" "$SCRIPT" "$@" 2>>"$LOG"
+        return $?
+    fi
+}
+
+launch "$@"
+EXIT_CODE=$?
+if [ $EXIT_CODE -ne 0 ]; then
+    log "Salida con código de error $EXIT_CODE. Revisa $LOG y /tmp/spyguard-control-panel.log"
+fi
+exit $EXIT_CODE
